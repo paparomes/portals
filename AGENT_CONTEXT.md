@@ -1,9 +1,9 @@
-# Portals (DocSync) - Agent context
+# Portals - Agent context
 
 ## Project overview
 
-**Code name**: Portals
-**Official name**: DocSync
+**Official name**: Portals
+**CLI command**: `docsync`
 
 Multi-platform document synchronization tool that keeps local markdown files in sync with Notion, Google Docs, and Obsidian.
 

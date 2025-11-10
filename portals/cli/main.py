@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 
 @click.group()
-@click.version_option(version=__version__, prog_name="Portals (docsync)")
+@click.version_option(version=__version__, prog_name="Portals")
 @click.option(
     "--log-level",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
@@ -112,9 +112,10 @@ def watch(ctx: click.Context) -> None:
 @click.pass_context
 def version(ctx: click.Context) -> None:
     """Show version information."""
-    click.echo(f"Portals (docsync) version {__version__}")
+    click.echo(f"Portals version {__version__}")
     click.echo("Multi-platform document synchronization tool")
-    click.echo("\nProject: https://github.com/yourusername/portals")
+    click.echo("CLI command: docsync")
+    click.echo("\nProject: https://github.com/paparomes/portals")
 
 
 if __name__ == "__main__":

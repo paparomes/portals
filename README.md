@@ -1,7 +1,7 @@
-# Portals (DocSync)
+# Portals
 
-**Code name**: Portals
-**Official name**: DocSync
+**Official name**: Portals
+**CLI command**: `docsync`
 
 Multi-platform document synchronization tool for keeping local markdown files in sync with Notion, Google Docs, and Obsidian.
 
@@ -13,7 +13,7 @@ Multi-platform document synchronization tool for keeping local markdown files in
 
 ## What is this?
 
-DocSync solves the problem of working with documents across multiple platforms. Instead of manually copying content between your local markdown files, Notion pages, Google Docs, and Obsidian vault, DocSync keeps them synchronized automatically.
+Portals solves the problem of working with documents across multiple platforms. Instead of manually copying content between your local markdown files, Notion pages, Google Docs, and Obsidian vault, Portals keeps them synchronized automatically.
 
 ### Primary use case
 

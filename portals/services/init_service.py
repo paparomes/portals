@@ -13,6 +13,7 @@ from portals.adapters.notion.adapter import NotionAdapter
 from portals.adapters.notion.hierarchy import NotionHierarchyManager
 from portals.core.directory_scanner import DirectoryScanner
 from portals.core.exceptions import PortalsError
+from portals.core.hierarchy_mapper import HierarchyMapper
 from portals.core.metadata_store import MetadataStore
 from portals.core.models import SyncDirection, SyncPair, SyncPairState
 
@@ -74,6 +75,11 @@ class InitService:
         self.notion_adapter = NotionAdapter(api_token=notion_token)
         self.directory_scanner = DirectoryScanner(base_path=self.base_path)
         self.hierarchy_manager = NotionHierarchyManager(root_page_id=root_page_id)
+        self.hierarchy_mapper = HierarchyMapper(
+            base_path=self.base_path,
+            notion_adapter=self.notion_adapter,
+            hierarchy_manager=self.hierarchy_manager,
+        )
         self.metadata_store = MetadataStore(base_path=self.base_path)
 
     async def initialize_mirror_mode(
@@ -114,9 +120,21 @@ class InitService:
                     errors=["No markdown files found"],
                 )
 
-            # 3. Create Notion pages and upload content
+            # 3. Build directory tree
+            logger.info("Building directory tree...")
+            tree = self.hierarchy_mapper.build_directory_tree(files)
+
+            # 4. Create Notion pages for directories
+            logger.info("Creating Notion folder pages...")
+            folder_pages_created = await self.hierarchy_mapper.create_notion_hierarchy(
+                tree,
+                dry_run=dry_run,
+            )
+            logger.info(f"Created {folder_pages_created} folder pages")
+
+            # 5. Create Notion pages for files and upload content
             files_synced = 0
-            pages_created = 0
+            file_pages_created = 0
             errors: list[str] = []
 
             for file_info in files:
@@ -125,8 +143,20 @@ class InitService:
                     local_uri = f"file://{file_info.path}"
                     doc = await self.local_adapter.read(local_uri)
 
-                    # Determine parent page ID based on directory structure
-                    parent_id = self.hierarchy_manager.get_parent_for_path(file_info.relative_path)
+                    # Find parent directory node
+                    dir_node = self.hierarchy_mapper.get_directory_for_file(
+                        tree, file_info.relative_path
+                    )
+
+                    # Determine parent page ID
+                    parent_id: str | None
+                    if dir_node and dir_node.notion_page_id:
+                        parent_id = dir_node.notion_page_id
+                    else:
+                        parent_id = self.hierarchy_manager.root_page_id
+
+                    if not parent_id:
+                        raise PortalsError("No parent page ID available for file creation")
 
                     if not dry_run:
                         # Create Notion page
@@ -147,7 +177,7 @@ class InitService:
                             parent_id=parent_id,
                         )
 
-                        pages_created += 1
+                        file_pages_created += 1
 
                     files_synced += 1
                     logger.info(f"Synced: {file_info.relative_path}")
@@ -156,6 +186,8 @@ class InitService:
                     error_msg = f"Failed to sync {file_info.relative_path}: {e}"
                     logger.error(error_msg)
                     errors.append(error_msg)
+
+            pages_created = folder_pages_created + file_pages_created
 
             # 4. Save metadata
             if not dry_run:

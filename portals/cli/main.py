@@ -9,6 +9,13 @@ from pathlib import Path
 import click
 
 from portals import __version__
+from portals.adapters.local import LocalFileAdapter
+from portals.adapters.notion.adapter import NotionAdapter
+from portals.core.conflict_resolver import ConflictResolver, ResolutionStrategy
+from portals.core.diff_generator import DiffGenerator
+from portals.core.metadata_store import MetadataStore
+from portals.core.models import SyncPair
+from portals.core.sync_engine import SyncEngine
 from portals.services.init_service import InitService
 from portals.services.sync_service import SyncService
 from portals.utils.logging import configure_logging, get_logger
@@ -330,6 +337,174 @@ def sync(
             raise click.Abort() from e
 
     asyncio.run(run_sync())
+
+
+@cli.command()
+@click.argument("path")
+@click.option(
+    "--base-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=".",
+    help="Base directory (defaults to current directory)",
+)
+@click.pass_context
+def resolve(ctx: click.Context, path: str, base_dir: str) -> None:
+    """Interactively resolve conflicts for a file.
+
+    Shows differences between local and remote versions and prompts
+    for resolution strategy.
+
+    \b
+    Example:
+      docsync resolve docs/README.md
+    """
+    logger.info("resolve_command", path=path)
+
+    async def run_resolve() -> None:
+        base_path = Path(base_dir).resolve()
+        notion_token = os.getenv("NOTION_API_TOKEN")
+
+        if not notion_token:
+            click.echo("❌ Error: Notion API token required")
+            click.echo("   Set NOTION_API_TOKEN environment variable")
+            raise click.Abort()
+
+        # Load metadata
+        metadata_store = MetadataStore(base_path=base_path)
+        if not metadata_store.exists():
+            click.echo("❌ Not initialized. Run 'docsync init' first.")
+            raise click.Abort()
+
+        metadata = await metadata_store.load()
+        pairs = metadata.get("pairs", [])
+
+        # Find pair for this file
+        file_path = Path(path)
+        if file_path.is_absolute():
+            file_path = file_path.relative_to(base_path)
+
+        pair_data = next(
+            (p for p in pairs if Path(p["local_path"]) == file_path),
+            None,
+        )
+
+        if not pair_data:
+            click.echo(f"❌ No sync pair found for {path}")
+            raise click.Abort()
+
+        pair = SyncPair.from_dict(pair_data)
+
+        # Initialize adapters and resolver
+        local_adapter = LocalFileAdapter()
+        notion_adapter = NotionAdapter(api_token=notion_token)
+        sync_engine = SyncEngine(
+            local_adapter=local_adapter,
+            remote_adapter=notion_adapter,
+        )
+        resolver = ConflictResolver(
+            sync_engine=sync_engine,
+            local_adapter=local_adapter,
+        )
+
+        try:
+            # Read both versions
+            local_doc = await local_adapter.read(f"file://{base_path / file_path}")
+            remote_doc = await notion_adapter.read(pair.remote_uri)
+
+            # Check if there's actually a conflict
+            conflict_info = resolver.get_conflict_info(local_doc, remote_doc)
+            if not conflict_info["has_conflict"]:
+                click.echo("✅ No conflicts detected - files are identical")
+                return
+
+            # Show conflict information
+            click.echo(f"\n⚠️  Conflict detected: {path}")
+            click.echo("\nBoth local and remote versions have changed since last sync.")
+            click.echo("\n" + "━" * 60)
+
+            # Show diff preview
+            diff_preview = resolver.format_diff_preview(local_doc, remote_doc, max_lines=15)
+            if diff_preview:
+                click.echo("\n📊 Changes:")
+                click.echo(diff_preview)
+
+            # Show change summary
+            changes = conflict_info["changes"]
+            click.echo("\n" + "━" * 60)
+            click.echo("\n📈 Summary:")
+            click.echo(f"   Additions: {changes['additions']} lines")
+            click.echo(f"   Deletions: {changes['deletions']} lines")
+            click.echo(f"   Changes: {changes['changes']} lines")
+
+            # Prompt for resolution
+            click.echo("\n" + "━" * 60)
+            click.echo("\nHow would you like to resolve?")
+            click.echo("\n[L] Use Local version")
+            click.echo("[R] Use Remote (Notion) version")
+            click.echo("[M] Merge manually (open editor)")
+            click.echo("[D] Show detailed diff")
+            click.echo("[C] Cancel")
+
+            while True:
+                choice = click.prompt("\nChoice", type=str).upper()
+
+                if choice == "L":
+                    strategy = ResolutionStrategy.USE_LOCAL
+                    break
+                elif choice == "R":
+                    strategy = ResolutionStrategy.USE_REMOTE
+                    break
+                elif choice == "M":
+                    strategy = ResolutionStrategy.MERGE_MANUAL
+                    break
+                elif choice == "D":
+                    # Show full diff
+                    diff_gen = DiffGenerator()
+                    full_diff = diff_gen.generate_unified_diff(
+                        local_doc.content,
+                        remote_doc.content,
+                    )
+                    click.echo("\n" + "─" * 60)
+                    click.echo(full_diff)
+                    click.echo("─" * 60)
+                    continue
+                elif choice == "C":
+                    click.echo("❌ Resolution cancelled")
+                    return
+                else:
+                    click.echo("Invalid choice. Please select L, R, M, D, or C.")
+                    continue
+
+            # Apply resolution
+            click.echo(f"\n🔄 Applying resolution: {strategy.value}...")
+            success = await resolver.resolve_conflict(
+                pair,
+                local_doc,
+                remote_doc,
+                strategy,
+            )
+
+            if success:
+                # Update metadata
+                metadata = await metadata_store.load()
+                pairs = metadata.get("pairs", [])
+                for i, p in enumerate(pairs):
+                    if Path(p["local_path"]) == file_path:
+                        pairs[i] = pair.to_dict()
+                        break
+                metadata["pairs"] = pairs
+                await metadata_store.save(metadata)
+
+                click.echo(f"✅ Conflict resolved for {path}")
+            else:
+                click.echo("❌ Resolution failed or cancelled")
+
+        except Exception as e:
+            click.echo(f"\n❌ Error resolving conflict: {e}")
+            logger.error("resolve_failed", error=str(e))
+            raise click.Abort() from e
+
+    asyncio.run(run_resolve())
 
 
 @cli.command()

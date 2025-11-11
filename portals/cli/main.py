@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 import click
 
 from portals import __version__
+from portals.services.init_service import InitService
 from portals.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -61,14 +65,99 @@ def cli(ctx: click.Context, log_level: str, log_format: str) -> None:
 
 
 @cli.command()
+@click.option(
+    "--root-page-id",
+    required=True,
+    help="Notion root page ID where synced pages will be created as children",
+)
+@click.option(
+    "--notion-token",
+    envvar="NOTION_API_TOKEN",
+    help="Notion API token (or set NOTION_API_TOKEN env var)",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Preview what would be created without actually creating pages",
+)
+@click.option(
+    "--path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=".",
+    help="Directory to sync (defaults to current directory)",
+)
 @click.pass_context
-def init(ctx: click.Context) -> None:
-    """Initialize Portals in the current directory.
+def init(
+    ctx: click.Context,
+    root_page_id: str,
+    notion_token: str | None,
+    dry_run: bool,
+    path: str,
+) -> None:
+    """Initialize Portals mirror mode for Notion sync.
 
-    Sets up sync configuration and metadata storage.
+    Sets up bidirectional sync between a local directory and Notion pages.
+
+    \b
+    Example:
+      docsync init --root-page-id=abc123 --notion-token=secret_xxx
+
+    Or set NOTION_API_TOKEN environment variable:
+      export NOTION_API_TOKEN=secret_xxx
+      docsync init --root-page-id=abc123
     """
-    logger.info("init_command", message="Initialize command (not yet implemented)")
-    click.echo("✨ Portals initialization (coming in Phase 3)")
+    # Get Notion token
+    if not notion_token:
+        click.echo("❌ Error: Notion API token required")
+        click.echo("   Set --notion-token or NOTION_API_TOKEN environment variable")
+        raise click.Abort()
+
+    logger.info(
+        "init_command",
+        root_page_id=root_page_id,
+        dry_run=dry_run,
+        path=path,
+    )
+
+    # Run async initialization
+    async def run_init() -> None:
+        base_path = Path(path).resolve()
+
+        click.echo(f"🔍 Initializing Portals in {base_path}")
+        if dry_run:
+            click.echo("   (DRY RUN - no pages will be created)")
+
+        # Create init service
+        init_service = InitService(
+            base_path=base_path,
+            notion_token=notion_token,
+            root_page_id=root_page_id,
+        )
+
+        # Run initialization
+        try:
+            result = await init_service.initialize_mirror_mode(dry_run=dry_run)
+
+            if result.success:
+                click.echo("\n✅ Initialization complete!")
+                click.echo(f"   Files synced: {result.files_synced}")
+                click.echo(f"   Pages created: {result.pages_created}")
+
+                if not dry_run:
+                    click.echo(f"\n💡 Metadata saved to {base_path / '.docsync'}")
+                    click.echo("   Run 'docsync sync' to perform bidirectional sync")
+                    click.echo("   Run 'docsync watch' to auto-sync changes")
+            else:
+                click.echo("\n⚠️  Initialization completed with errors:")
+                for error in result.errors:
+                    click.echo(f"   - {error}")
+
+        except Exception as e:
+            click.echo(f"\n❌ Initialization failed: {e}")
+            logger.error("init_failed", error=str(e))
+            raise click.Abort() from e
+
+    asyncio.run(run_init())
 
 
 @cli.command()

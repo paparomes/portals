@@ -99,6 +99,25 @@ class SyncPairState:
             "last_error": self.last_error,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SyncPairState:
+        """Create from dictionary.
+
+        Args:
+            data: Dictionary representation
+
+        Returns:
+            SyncPairState instance
+        """
+        return cls(
+            local_hash=data["local_hash"],
+            remote_hash=data["remote_hash"],
+            last_synced_hash=data["last_synced_hash"],
+            last_sync=datetime.fromisoformat(data["last_sync"]),
+            has_conflict=data.get("has_conflict", False),
+            last_error=data.get("last_error"),
+        )
+
 
 @dataclass
 class SyncPair:
@@ -125,6 +144,28 @@ class SyncPair:
             "conflict_resolution": self.conflict_resolution.value,
             "state": self.state.to_dict() if self.state else None,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SyncPair:
+        """Create from dictionary.
+
+        Args:
+            data: Dictionary representation
+
+        Returns:
+            SyncPair instance
+        """
+        state_data = data.get("state")
+        return cls(
+            id=data["id"],
+            local_path=data["local_path"],
+            remote_uri=data["remote_uri"],
+            remote_platform=data["remote_platform"],
+            created_at=datetime.fromisoformat(data["created_at"]),
+            sync_direction=SyncDirection(data.get("sync_direction", "bidirectional")),
+            conflict_resolution=ConflictResolution(data.get("conflict_resolution", "manual")),
+            state=SyncPairState.from_dict(state_data) if state_data else None,
+        )
 
 
 @dataclass

@@ -508,15 +508,127 @@ def resolve(ctx: click.Context, path: str, base_dir: str) -> None:
 
 
 @cli.command()
+@click.option(
+    "--auto",
+    is_flag=True,
+    help="Auto-sync without prompting (default: prompt for each change)",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would be synced without actually syncing",
+)
+@click.option(
+    "--base-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=".",
+    help="Base directory (defaults to current directory)",
+)
+@click.option(
+    "--poll-interval",
+    type=int,
+    default=30,
+    help="Seconds between Notion polls (default: 30)",
+)
 @click.pass_context
-def watch(ctx: click.Context) -> None:
-    """Watch for file changes and prompt to sync.
+def watch(
+    ctx: click.Context,
+    auto: bool,
+    dry_run: bool,
+    base_dir: str,
+    poll_interval: int,
+) -> None:
+    """Watch for file changes and sync.
 
     Runs continuously, monitoring for local and remote changes.
     Press Ctrl+C to stop.
+
+    \\b
+    Examples:
+      # Watch with prompts (default)
+      docsync watch
+
+      # Auto-sync without prompts
+      docsync watch --auto
+
+      # Dry run (show what would be synced)
+      docsync watch --dry-run
+
+      # Custom poll interval
+      docsync watch --poll-interval=60
     """
-    logger.info("watch_command", message="Watch command (not yet implemented)")
-    click.echo("👀 Watch mode (coming in Phase 6)")
+    # Validate flags
+    if auto and dry_run:
+        click.echo("❌ Error: Cannot use both --auto and --dry-run")
+        raise click.Abort()
+
+    # Determine mode
+    if auto:
+        mode = "auto"
+    elif dry_run:
+        mode = "dry_run"
+    else:
+        mode = "prompt"
+
+    logger.info(
+        "watch_command",
+        mode=mode,
+        base_dir=base_dir,
+        poll_interval=poll_interval,
+    )
+
+    async def run_watch() -> None:
+        base_path = Path(base_dir).resolve()
+        notion_token = os.getenv("NOTION_API_TOKEN")
+
+        if not notion_token:
+            click.echo("❌ Error: Notion API token required")
+            click.echo("   Set NOTION_API_TOKEN environment variable")
+            raise click.Abort()
+
+        # Import here to avoid circular import
+        from portals.watcher.watch_service import WatchService
+
+        watch_service = WatchService(
+            base_path=base_path,
+            notion_token=notion_token,
+            mode=mode,
+            poll_interval=float(poll_interval),
+        )
+
+        try:
+            # Start watching
+            await watch_service.start()
+
+            mode_desc = {
+                "auto": "AUTO-SYNC",
+                "prompt": "PROMPT",
+                "dry_run": "DRY RUN",
+            }[mode]
+
+            click.echo(f"\n👀 Watching {base_path}")
+            click.echo(f"   Mode: {mode_desc}")
+            click.echo(f"   Notion poll interval: {poll_interval}s")
+            click.echo(f"   Monitoring {len(watch_service.sync_pairs)} sync pairs")
+            click.echo("\n   Press Ctrl+C to stop\n")
+
+            # Keep running until interrupted
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                click.echo("\n\n✋ Stopping watch mode...")
+
+        except Exception as e:
+            click.echo(f"\n❌ Watch failed: {e}")
+            logger.error("watch_failed", error=str(e))
+            raise click.Abort() from e
+        finally:
+            # Stop watching
+            await watch_service.stop()
+            click.echo("✅ Watch mode stopped")
+
+    asyncio.run(run_watch())
 
 
 @cli.command()

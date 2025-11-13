@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
-from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -12,8 +13,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from portals.core.adapter import DocumentAdapter
+from portals.adapters.base import DocumentAdapter, PlatformURI, RemoteMetadata
 from portals.adapters.gdocs.converter import GoogleDocsConverter
+from portals.core.exceptions import AdapterError
+from portals.core.models import Document, DocumentMetadata
 
 
 SCOPES = [
@@ -26,7 +29,7 @@ class GoogleDocsAdapter(DocumentAdapter):
     """Adapter for Google Docs with full formatting support.
 
     Uses direct Google Docs API access for full control over formatting,
-    bypassing MCP tool limitations.
+    including heading styles and native lists.
     """
 
     def __init__(
@@ -87,7 +90,7 @@ class GoogleDocsAdapter(DocumentAdapter):
                 if not os.path.exists(self.credentials_path):
                     raise FileNotFoundError(
                         f"Google credentials not found at {self.credentials_path}. "
-                        "Please download OAuth2 credentials from Google Cloud Console."
+                        "Please set up OAuth2 credentials."
                     )
 
                 flow = InstalledAppFlow.from_client_secrets_file(
@@ -102,161 +105,67 @@ class GoogleDocsAdapter(DocumentAdapter):
 
         return creds
 
-    def read(self, remote_id: str) -> dict[str, Any]:
+    async def read(self, uri: str) -> Document:
         """Read document from Google Docs.
 
         Args:
-            remote_id: Google Docs document ID
+            uri: Google Docs URI (e.g., "gdocs://doc-id")
 
         Returns:
-            Document metadata and content
+            Document object with content and metadata
         """
         try:
-            # Get document
-            doc = self.service.documents().get(documentId=remote_id).execute()
+            parsed_uri = self.parse_uri(uri)
+            doc_id = parsed_uri.identifier
 
-            # Extract content
+            # Get document
+            doc = self.service.documents().get(documentId=doc_id).execute()
+
+            # Extract content (simplified - just plain text for now)
             content = self._extract_content(doc)
 
             # Get metadata from Drive
             drive_file = self.drive_service.files().get(
-                fileId=remote_id,
+                fileId=doc_id,
                 fields='id,name,modifiedTime,createdTime'
             ).execute()
 
-            return {
-                'id': remote_id,
-                'title': doc.get('title', ''),
-                'content': content,
-                'modified_time': drive_file.get('modifiedTime'),
-                'created_time': drive_file.get('createdTime'),
-            }
+            # Parse timestamps
+            modified_time = datetime.fromisoformat(
+                drive_file.get('modifiedTime', datetime.now().isoformat()).replace('Z', '+00:00')
+            )
+            created_time = datetime.fromisoformat(
+                drive_file.get('createdTime', datetime.now().isoformat()).replace('Z', '+00:00')
+            )
+
+            metadata = DocumentMetadata(
+                title=doc.get('title', ''),
+                created_at=created_time,
+                modified_at=modified_time,
+            )
+
+            return Document(content=content, metadata=metadata)
 
         except HttpError as e:
-            raise RuntimeError(f"Failed to read Google Doc {remote_id}: {e}")
+            raise AdapterError(f"Failed to read Google Doc {uri}: {e}") from e
 
-    def write(self, remote_id: str | None, content: str, title: str | None = None) -> str:
+    async def write(self, uri: str, doc: Document) -> None:
         """Write document to Google Docs with full formatting.
 
         Args:
-            remote_id: Document ID (None to create new)
-            content: Markdown content
-            title: Document title
-
-        Returns:
-            Document ID
-        """
-        if remote_id is None:
-            # Create new document
-            return self._create_document(title or "Untitled", content)
-        else:
-            # Update existing document
-            self._update_document(remote_id, content)
-            return remote_id
-
-    def delete(self, remote_id: str) -> None:
-        """Delete document from Google Docs.
-
-        Args:
-            remote_id: Document ID
+            uri: Google Docs URI
+            doc: Document to write
         """
         try:
-            self.drive_service.files().delete(fileId=remote_id).execute()
-        except HttpError as e:
-            raise RuntimeError(f"Failed to delete Google Doc {remote_id}: {e}")
+            parsed_uri = self.parse_uri(uri)
+            doc_id = parsed_uri.identifier
 
-    def list_documents(self, folder_id: str | None = None) -> list[dict[str, Any]]:
-        """List Google Docs.
-
-        Args:
-            folder_id: Optional folder ID to filter by
-
-        Returns:
-            List of document metadata
-        """
-        try:
-            query = "mimeType='application/vnd.google-apps.document'"
-            if folder_id:
-                query += f" and '{folder_id}' in parents"
-
-            results = self.drive_service.files().list(
-                q=query,
-                fields='files(id,name,modifiedTime,createdTime)',
-                orderBy='modifiedTime desc'
-            ).execute()
-
-            files = results.get('files', [])
-
-            return [
-                {
-                    'id': f['id'],
-                    'title': f['name'],
-                    'modified_time': f.get('modifiedTime'),
-                    'created_time': f.get('createdTime'),
-                }
-                for f in files
-            ]
-
-        except HttpError as e:
-            raise RuntimeError(f"Failed to list Google Docs: {e}")
-
-    def _create_document(self, title: str, content: str) -> str:
-        """Create new Google Doc with formatting.
-
-        Args:
-            title: Document title
-            content: Markdown content
-
-        Returns:
-            Document ID
-        """
-        try:
-            # Create empty document
-            doc = self.service.documents().create(body={'title': title}).execute()
-            doc_id = doc['documentId']
-
-            # Convert markdown
-            result = self.converter.markdown_to_gdocs(content)
-
-            # Build requests
-            requests = []
-
-            # 1. Insert plain text
-            requests.append({
-                'insertText': {
-                    'location': {'index': 1},
-                    'text': result.plain_text
-                }
-            })
-
-            # 2. Apply formatting
-            requests.extend(self.converter.generate_batch_requests(result))
-
-            # Execute batch update
-            self.service.documents().batchUpdate(
-                documentId=doc_id,
-                body={'requests': requests}
-            ).execute()
-
-            return doc_id
-
-        except HttpError as e:
-            raise RuntimeError(f"Failed to create Google Doc: {e}")
-
-    def _update_document(self, doc_id: str, content: str) -> None:
-        """Update existing Google Doc with formatting.
-
-        Args:
-            doc_id: Document ID
-            content: Markdown content
-        """
-        try:
             # Get current document
-            doc = self.service.documents().get(documentId=doc_id).execute()
-            doc_length = doc['body']['content'][-1]['endIndex'] - 1
+            gdoc = self.service.documents().get(documentId=doc_id).execute()
+            doc_length = gdoc['body']['content'][-1]['endIndex'] - 1
 
             # Convert markdown
-            result = self.converter.markdown_to_gdocs(content)
+            result = self.converter.markdown_to_gdocs(doc.content)
 
             # Build requests
             requests = []
@@ -289,8 +198,172 @@ class GoogleDocsAdapter(DocumentAdapter):
                 body={'requests': requests}
             ).execute()
 
+            # Update title if changed
+            if doc.metadata.title:
+                self.drive_service.files().update(
+                    fileId=doc_id,
+                    body={'name': doc.metadata.title}
+                ).execute()
+
         except HttpError as e:
-            raise RuntimeError(f"Failed to update Google Doc {doc_id}: {e}")
+            raise AdapterError(f"Failed to write Google Doc {uri}: {e}") from e
+
+    async def get_metadata(self, uri: str) -> RemoteMetadata:
+        """Get document metadata without reading full content.
+
+        Args:
+            uri: Google Docs URI
+
+        Returns:
+            RemoteMetadata with hash and timestamp
+        """
+        try:
+            parsed_uri = self.parse_uri(uri)
+            doc_id = parsed_uri.identifier
+
+            # Get metadata from Drive
+            drive_file = self.drive_service.files().get(
+                fileId=doc_id,
+                fields='id,modifiedTime,md5Checksum'
+            ).execute()
+
+            # Use MD5 from Drive, or generate from modified time
+            content_hash = drive_file.get('md5Checksum', '')
+            if not content_hash:
+                content_hash = hashlib.md5(
+                    drive_file.get('modifiedTime', '').encode()
+                ).hexdigest()
+
+            return RemoteMetadata(
+                uri=uri,
+                content_hash=content_hash,
+                last_modified=drive_file.get('modifiedTime', ''),
+                exists=True
+            )
+
+        except HttpError as e:
+            if e.resp.status == 404:
+                return RemoteMetadata(
+                    uri=uri,
+                    content_hash='',
+                    last_modified='',
+                    exists=False
+                )
+            raise AdapterError(f"Failed to get metadata for {uri}: {e}") from e
+
+    async def exists(self, uri: str) -> bool:
+        """Check if document exists.
+
+        Args:
+            uri: Google Docs URI
+
+        Returns:
+            True if document exists
+        """
+        try:
+            parsed_uri = self.parse_uri(uri)
+            doc_id = parsed_uri.identifier
+
+            self.drive_service.files().get(fileId=doc_id, fields='id').execute()
+            return True
+
+        except HttpError as e:
+            if e.resp.status == 404:
+                return False
+            raise AdapterError(f"Failed to check existence of {uri}: {e}") from e
+
+    def parse_uri(self, uri: str) -> PlatformURI:
+        """Parse Google Docs URI.
+
+        Args:
+            uri: URI string (e.g., "gdocs://doc-id" or just "doc-id")
+
+        Returns:
+            Parsed PlatformURI object
+        """
+        if uri.startswith("gdocs://"):
+            doc_id = uri[8:]
+        elif uri.startswith("https://docs.google.com/document/d/"):
+            # Extract doc ID from full URL
+            doc_id = uri.split("/document/d/")[1].split("/")[0]
+        else:
+            # Assume it's just the doc ID
+            doc_id = uri
+
+        return PlatformURI(
+            platform="gdocs",
+            identifier=doc_id,
+            raw_uri=f"gdocs://{doc_id}"
+        )
+
+    async def create(self, uri: str, doc: Document, parent_id: str | None = None) -> str:
+        """Create new Google Doc with formatting.
+
+        Args:
+            uri: URI (title will be used)
+            doc: Document to create
+            parent_id: Optional folder ID
+
+        Returns:
+            Full URI of created document
+        """
+        try:
+            # Create empty document
+            gdoc = self.service.documents().create(
+                body={'title': doc.metadata.title or 'Untitled'}
+            ).execute()
+            doc_id = gdoc['documentId']
+
+            # Convert markdown
+            result = self.converter.markdown_to_gdocs(doc.content)
+
+            # Build requests
+            requests = []
+
+            # 1. Insert plain text
+            requests.append({
+                'insertText': {
+                    'location': {'index': 1},
+                    'text': result.plain_text
+                }
+            })
+
+            # 2. Apply formatting
+            requests.extend(self.converter.generate_batch_requests(result))
+
+            # Execute batch update
+            self.service.documents().batchUpdate(
+                documentId=doc_id,
+                body={'requests': requests}
+            ).execute()
+
+            # Move to folder if specified
+            if parent_id:
+                self.drive_service.files().update(
+                    fileId=doc_id,
+                    addParents=parent_id,
+                    fields='id,parents'
+                ).execute()
+
+            return f"gdocs://{doc_id}"
+
+        except HttpError as e:
+            raise AdapterError(f"Failed to create Google Doc: {e}") from e
+
+    async def delete(self, uri: str) -> None:
+        """Delete document from Google Docs.
+
+        Args:
+            uri: Google Docs URI
+        """
+        try:
+            parsed_uri = self.parse_uri(uri)
+            doc_id = parsed_uri.identifier
+
+            self.drive_service.files().delete(fileId=doc_id).execute()
+
+        except HttpError as e:
+            raise AdapterError(f"Failed to delete Google Doc {uri}: {e}") from e
 
     def _extract_content(self, doc: dict[str, Any]) -> str:
         """Extract plain text content from Google Doc.

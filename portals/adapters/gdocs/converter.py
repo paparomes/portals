@@ -308,14 +308,16 @@ class GoogleDocsConverter:
         index: int,
         result: ConversionResult,
         ordered: bool = False,
+        nesting_level: int = 0,
     ) -> int:
-        """Process list tokens.
+        """Process list tokens including nested lists.
 
         Args:
             tokens: Token list
             index: Current index
             result: Result to update
             ordered: True for numbered lists
+            nesting_level: Current nesting depth
 
         Returns:
             New index after processing
@@ -336,9 +338,19 @@ class GoogleDocsConverter:
                         while i < len(tokens) and tokens[i].type != "paragraph_close":
                             if tokens[i].type == "inline":
                                 text_content = self._process_inline(tokens[i], result)
+                                # Strip checkbox markers like [ ] or [x]
+                                text_content = re.sub(r'^\s*\[\s*[x ]?\s*\]\s*', '', text_content)
                                 result.plain_text += text_content
                                 self.current_index += len(text_content)
                             i += 1
+                    elif tokens[i].type == "bullet_list_open":
+                        # Nested bullet list
+                        i = self._process_list(tokens, i, result, ordered=False, nesting_level=nesting_level + 1)
+                        continue
+                    elif tokens[i].type == "ordered_list_open":
+                        # Nested numbered list
+                        i = self._process_list(tokens, i, result, ordered=True, nesting_level=nesting_level + 1)
+                        continue
                     i += 1
 
                 # Add newline after list item
@@ -347,11 +359,12 @@ class GoogleDocsConverter:
 
                 item_end = self.current_index
 
-                # Track list item range
+                # Track list item range with nesting level
                 result.list_ranges.append({
                     "start_index": item_start,
                     "end_index": item_end,
                     "ordered": ordered,
+                    "nesting_level": nesting_level,
                 })
             i += 1
 
@@ -494,6 +507,8 @@ class GoogleDocsConverter:
                 })
 
             elif fmt.format_type == "code_inline":
+                # Note: Skip font family for now - API format is complex
+                # Just use smaller font size to distinguish inline code
                 requests.append({
                     "updateTextStyle": {
                         "range": {
@@ -501,10 +516,9 @@ class GoogleDocsConverter:
                             "endIndex": fmt.end_index,
                         },
                         "textStyle": {
-                            "fontFamily": "Courier New",
                             "fontSize": {"magnitude": 10, "unit": "PT"},
                         },
-                        "fields": "fontFamily,fontSize",
+                        "fields": "fontSize",
                     }
                 })
 
@@ -525,7 +539,9 @@ class GoogleDocsConverter:
         # Apply list formatting
         for list_range in conversion.list_ranges:
             bullet_preset = "NUMBERED_DECIMAL_ALPHA_ROMAN" if list_range["ordered"] else "BULLET_DISC_CIRCLE_SQUARE"
-            requests.append({
+            nesting_level = list_range.get("nesting_level", 0)
+
+            bullet_request = {
                 "createParagraphBullets": {
                     "range": {
                         "startIndex": list_range["start_index"],
@@ -533,6 +549,31 @@ class GoogleDocsConverter:
                     },
                     "bulletPreset": bullet_preset,
                 }
-            })
+            }
+
+            # Add nesting level if > 0
+            if nesting_level > 0:
+                # Use updateParagraphStyle to set indentation for nested lists
+                requests.append({
+                    "updateParagraphStyle": {
+                        "range": {
+                            "startIndex": list_range["start_index"],
+                            "endIndex": list_range["end_index"] - 1,
+                        },
+                        "paragraphStyle": {
+                            "indentStart": {
+                                "magnitude": 36 * nesting_level,  # 36 points per level
+                                "unit": "PT"
+                            },
+                            "indentFirstLine": {
+                                "magnitude": 18,
+                                "unit": "PT"
+                            }
+                        },
+                        "fields": "indentStart,indentFirstLine"
+                    }
+                })
+
+            requests.append(bullet_request)
 
         return requests
